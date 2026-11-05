@@ -1,0 +1,149 @@
+-- Special Wigs: Supabase setup. Run once in Supabase > SQL Editor > New query > Run.
+
+create table if not exists public.docs (
+  coll  text not null,
+  id    text not null,
+  data  jsonb not null default '{}'::jsonb,
+  owner uuid default auth.uid(),
+  ts    timestamptz not null default now(),
+  primary key (coll, id)
+);
+create table if not exists public.admins (uid uuid primary key);
+
+alter table public.docs   enable row level security;
+alter table public.admins enable row level security;
+
+create or replace function public.is_admin() returns boolean
+language sql security definer stable set search_path = public as
+$$ select exists (select 1 from public.admins where uid = auth.uid()) $$;
+
+create or replace function public.am_admin() returns boolean
+language sql security definer stable set search_path = public as
+$$ select public.is_admin() $$;
+
+drop policy if exists docs_sel on public.docs;
+drop policy if exists docs_ins on public.docs;
+drop policy if exists docs_upd on public.docs;
+drop policy if exists docs_del on public.docs;
+
+create policy docs_sel on public.docs for select to anon, authenticated using (
+  coll in ('wigs','gal','jobs','statuses','routes','site','requests')
+  or owner = auth.uid()
+  or public.is_admin()
+  or (coll = 'dl'       and auth.uid()::text in (data->>'cust', data->>'cour'))
+  or (coll = 'deals'    and auth.uid()::text in (data->>'buyer', data->>'seller'))
+  or (coll = 'contacts' and auth.uid()::text in (data->>'ownerUid', data->>'takerUid'))
+);
+
+create policy docs_ins on public.docs for insert to authenticated with check (
+  (owner = auth.uid()
+    and coll in ('members','requests','wigs','jobs','statuses','routes','gal','deals')
+    and (coll not in ('members','statuses') or id = auth.uid()::text))
+  or (coll = 'site' and public.is_admin())
+);
+
+create policy docs_upd on public.docs for update to authenticated
+using ((owner = auth.uid() and coll in ('members','requests','wigs','jobs','statuses','routes','gal','deals'))
+       or (public.is_admin()))
+with check ((owner = auth.uid() and coll in ('members','requests','wigs','jobs','statuses','routes','gal','deals'))
+       or (public.is_admin()));
+
+create policy docs_del on public.docs for delete to authenticated using (
+  (owner = auth.uid() and coll in ('requests','wigs','jobs','routes','gal','statuses'))
+  or public.is_admin()
+);
+
+-- Counts for the community strip, without exposing member details
+create or replace function public.role_counts() returns jsonb
+language sql security definer stable set search_path = public as $$
+  select jsonb_build_object(
+    'total', count(*),
+    'cust',  count(*) filter (where data->'roles' ? 'cust'),
+    'wm',    count(*) filter (where data->'roles' ? 'wm'),
+    'mfr',   count(*) filter (where data->'roles' ? 'mfr'),
+    'cour',  count(*) filter (where data->'roles' ? 'cour'),
+    'sell',  count(*) filter (where data->'roles' ? 'sell'))
+  from public.docs where coll = 'members' $$;
+
+-- Taking a lead: checks role, free leads, opens a private contact exchange
+create or replace function public.take_lead(req_id text, paid boolean default false)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare r public.docs; m public.docs; o public.docs; used int; is_free boolean; did text;
+begin
+  if auth.uid() is null then raise exception 'login'; end if;
+  select * into r from public.docs where coll='requests' and id=req_id for update;
+  if not found then raise exception 'notfound'; end if;
+  if coalesce((r.data->>'s')::int,0) <> 0 then raise exception 'taken'; end if;
+  if r.owner = auth.uid() then raise exception 'own'; end if;
+  select * into m from public.docs where coll='members' and owner=auth.uid();
+  if not found or not (m.data->'roles' ?| array['wm','mfr','sell','cour']) then raise exception 'role'; end if;
+  if r.data->>'type' = 'משלוח' and not (m.data->'roles' ? 'cour') then raise exception 'role'; end if;
+  select count(*) into used from public.docs where coll='requests' and data->>'taker' = auth.uid()::text;
+  is_free := used < 2;
+  if not is_free and not coalesce(paid,false) then raise exception 'payment'; end if;
+  select * into o from public.docs where coll='members' and owner=r.owner;
+  update public.docs set data = r.data || jsonb_build_object('s',1,'free',is_free,'taker',auth.uid()::text,'takerName',m.data->>'name')
+    where coll='requests' and id=req_id;
+  insert into public.docs(coll,id,data,owner) values ('contacts',req_id,
+    jsonb_build_object('ownerUid',r.owner::text,'takerUid',auth.uid()::text,'ownerPhone',o.data->>'phone','takerPhone',m.data->>'phone'), r.owner)
+    on conflict (coll,id) do nothing;
+  if r.data->>'type' = 'משלוח' then
+    did := 'd' || req_id;
+    insert into public.docs(coll,id,data,owner) values ('dl',did,
+      jsonb_build_object('title',r.data->>'desc','area',r.data->>'area','cust',r.owner::text,'custName',r.data->>'ownerName',
+        'cour',auth.uid()::text,'courName',m.data->>'name','step',0,'ts',(extract(epoch from now())*1000)::bigint), r.owner)
+      on conflict (coll,id) do nothing;
+    insert into public.docs(coll,id,data,owner) values ('codes',did,
+      jsonb_build_object('code', lpad((1000+floor(random()*9000))::int::text,4,'0')), r.owner)
+      on conflict (coll,id) do nothing;
+  end if;
+  return jsonb_build_object('free',is_free,'left',greatest(0,1-used));
+end $$;
+
+create or replace function public.adv_step(dl_id text) returns void
+language sql security definer set search_path = public as $$
+  update public.docs set data = jsonb_set(data,'{step}',to_jsonb((data->>'step')::int + 1))
+  where coll='dl' and id=dl_id and data->>'cour' = auth.uid()::text and (data->>'step')::int < 2 $$;
+
+create or replace function public.confirm_delivery(dl_id text, code text) returns boolean
+language plpgsql security definer set search_path = public as $$
+declare ok boolean;
+begin
+  select exists (
+    select 1 from public.docs d join public.docs c on c.coll='codes' and c.id=d.id
+    where d.coll='dl' and d.id=dl_id and d.data->>'cour'=auth.uid()::text
+      and (d.data->>'step')::int = 2 and c.data->>'code' = code) into ok;
+  if ok then
+    update public.docs set data = jsonb_set(data,'{step}','3') where coll='dl' and id=dl_id;
+  end if;
+  return ok;
+end $$;
+
+grant usage on schema public to anon, authenticated;
+grant select on public.docs to anon;
+grant select, insert, update, delete on public.docs to authenticated;
+grant execute on function public.am_admin(), public.role_counts() to anon, authenticated;
+grant execute on function public.take_lead(text,boolean), public.adv_step(text), public.confirm_delivery(text,text) to authenticated;
+
+-- Live updates
+do $$ begin
+  alter publication supabase_realtime add table public.docs;
+exception when others then null; end $$;
+
+-- Storage for photos and videos (up to 20MB)
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('media','media', true, 20971520,
+  array['image/jpeg','image/png','image/webp','image/gif','video/mp4','video/webm'])
+on conflict (id) do update set public = true, file_size_limit = 20971520,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists media_read on storage.objects;
+drop policy if exists media_ins  on storage.objects;
+drop policy if exists media_del  on storage.objects;
+create policy media_read on storage.objects for select using (bucket_id = 'media');
+create policy media_ins  on storage.objects for insert to authenticated with check (
+  bucket_id = 'media' and (
+    (storage.foldername(name))[1] = auth.uid()::text
+    or ((storage.foldername(name))[1] = 'site' and public.is_admin())));
+create policy media_del  on storage.objects for delete to authenticated using (
+  bucket_id = 'media' and ((storage.foldername(name))[1] = auth.uid()::text or public.is_admin()));
