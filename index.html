@@ -182,6 +182,7 @@ input[type=password]{width:100%;padding:13px 18px;border:1px solid var(--line);b
 <footer><div class="wrap"><div class="logo">Special <b>Wigs</b></div><div style="margin-bottom:8px;color:var(--gold2)">Right to You · ספיישל ויגס עד אליך</div>האתר משמש פלטפורמת קישור ותקשורת בין חברות הקהילה, ואינו צד לעסקאות. המחירים להמחשה בלבד.</div></footer>
 
 <div class="pop" id="pop"><div class="panel"><h3 id="pt"></h3><div id="pp" style="color:var(--mute);margin:12px 0 20px"></div><button class="btn" onclick="$('pop').classList.remove('on')">סגירה</button></div></div>
+<button id="fab" class="btn hide" onclick="admin();this.classList.add('hide')" style="position:fixed;left:18px;bottom:calc(18px + env(safe-area-inset-bottom,0px));z-index:40;box-shadow:0 12px 30px -12px rgba(0,0,0,.5)">✎ עריכת האתר</button>
 <div id="toast"></div>
 <script>
 var $=function(i){return document.getElementById(i)};
@@ -301,7 +302,7 @@ if(db)db.doc('site/content').onSnapshot(function(s){if(s.exists){K=s.data();appl
 var CFG=window.SW_CONFIG||{},sb=null,SES=null,RC=null,CT={},CD={};
 function cfgOk(){return CFG.url&&CFG.key&&CFG.url.indexOf('YOUR')<0&&window.supabase}
 function noCfg(){popup('האתר עוד לא מחובר','חסרים מפתחות Supabase בראש קובץ index.html (שורת SW_CONFIG).')}
-function setSes(s){SES=s;uid=s&&s.user?s.user.id:'anon';$('authin').classList.toggle('hide',!!s);$('authout').classList.toggle('hide',!s);if(s)$('aem').textContent=s.user.email||''}
+function setSes(s){SES=s;uid=s&&s.user?s.user.id:'anon';$('authin').classList.toggle('hide',!!s);$('authout').classList.toggle('hide',!s);if(s)$('aem').textContent=s.user.email||'';if(sb&&s){sb.rpc('am_admin').then(function(r){$('fab').classList.toggle('hide',!r.data||isAdm)}).catch(function(){})}else $('fab').classList.add('hide')}
 async function doSignUp(){if(!sb)return noCfg();var e=$('ae').value.trim(),p=$('ap').value;if(!e||p.length<8)return toast('אימייל וסיסמה של 8 תווים לפחות');var r=await sb.auth.signUp({email:e,password:p});if(r.error)return toast(r.error.message);if(!r.data.session)popup('כמעט סיימנו','נשלח אלייך מייל לאישור. אחרי האישור חזרי וכנסי.');else toast('נרשמת בהצלחה')}
 async function doSignIn(){if(!sb)return noCfg();var r=await sb.auth.signInWithPassword({email:$('ae').value.trim(),password:$('ap').value});if(r.error)return toast('אימייל או סיסמה שגויים');toast('התחברת')}
 async function doSignOut(){if(sb)await sb.auth.signOut();me=null;render()}
